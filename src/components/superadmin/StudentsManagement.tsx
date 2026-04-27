@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { safeLogger } from '@/lib/safe-logger';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -11,7 +12,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { AlertTriangle, Plus, Edit, Trash2, Users, Activity, DollarSign, Download, CheckCircle, XCircle, Search, Filter, Clock, Ban, ChevronDown, ChevronUp, FileText, Key, Lock, Eye, Settings, Award, RefreshCw, CalendarIcon, BookOpen, MessageSquare } from 'lucide-react';
+import { AlertTriangle, Plus, Edit, Trash2, Users, Activity, DollarSign, Download, CheckCircle, XCircle, Search, Filter, Clock, Ban, ChevronDown, ChevronUp, FileText, Key, Lock, Eye, Settings, Award, RefreshCw, CalendarIcon, BookOpen, MessageSquare, Send } from 'lucide-react';
 import { StudentAccessManagement } from './StudentAccessManagement';
 import { SuspensionDialog } from '@/components/SuspensionDialog';
 import { StudentNotesDialog } from '@/components/StudentNotesDialog';
@@ -27,6 +28,8 @@ import { useAuth } from '@/hooks/useAuth';
 import { formatCurrency } from '@/utils/currencyFormatter';
 import { cn } from '@/lib/utils';
 import { logAdminAction, ACTIVITY_TYPES } from '@/lib/activity-logger';
+import { useScheduledSuspensions } from '@/hooks/useScheduledSuspensions';
+import type { SuspensionConfirmData } from '@/components/SuspensionDialog';
 import jsPDF from 'jspdf';
 interface Student {
   id: string;
@@ -81,6 +84,8 @@ export function StudentsManagement() {
     user
   } = useAuth();
   const isSupportMember = user?.role === 'support_member';
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialSearch = searchParams.get('search') || '';
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
@@ -90,7 +95,17 @@ export function StudentsManagement() {
   const [suspendedStudents, setSuspendedStudents] = useState(0);
   const [overdueStudents, setOverdueStudents] = useState(0);
   const [filteredStudents, setFilteredStudents] = useState<Student[]>([]);
-  const [searchTerm, setSearchTerm] = useState('');
+  const [searchTerm, setSearchTerm] = useState(initialSearch);
+
+  // Sync searchTerm when URL ?search= changes (e.g., navigated from At-Risk page)
+  useEffect(() => {
+    const urlSearch = searchParams.get('search');
+    if (urlSearch && urlSearch !== searchTerm) {
+      setSearchTerm(urlSearch);
+      setFiltersOpen(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
   const [lmsStatusFilter, setLmsStatusFilter] = useState('all');
   const [feesStructureFilter, setFeesStructureFilter] = useState('all');
   const [invoiceFilter, setInvoiceFilter] = useState('all');
@@ -159,13 +174,30 @@ export function StudentsManagement() {
     options: installmentOptions
   } = useInstallmentOptions();
 
-  // Debug: Ensure statusFilter is completely removed
-  safeLogger.info('StudentsManagement component loaded - statusFilter removed');
+  const studentIds = students.map(s => s.id);
+  const {
+    suspensions: scheduledSuspensions,
+    createScheduledSuspension,
+    cancelScheduledSuspension,
+    fetchSuspensions: refetchSuspensions,
+  } = useScheduledSuspensions(studentIds);
+
   useEffect(() => {
     fetchStudents();
     fetchCompanyCurrency();
     fetchBatchOptions();
     fetchCoursesAndPathways();
+    // Safety watchdog: if loading hasn't cleared after 15s, release the spinner
+    // so the user is never stuck on "Loading students..." forever.
+    const watchdog = setTimeout(() => {
+      setLoading(prev => {
+        if (prev) {
+          console.warn('[StudentsManagement] Watchdog: forcing loading=false after 15s');
+        }
+        return false;
+      });
+    }, 15000);
+    return () => clearTimeout(watchdog);
   }, []);
   useEffect(() => {
     if (students.length > 0) {
@@ -271,17 +303,53 @@ export function StudentsManagement() {
     }
   };
 
-  const handleSuspendStudent = async (data: { note: string; autoUnsuspendDate?: Date }) => {
+  const handleSuspendStudent = async (data: SuspensionConfirmData) => {
     if (!studentForSuspension) return;
     setSuspensionLoading(true);
     try {
+      // If a schedule date is set, create a scheduled suspension instead of immediate
+      if (data.scheduleSuspendDate) {
+        const { error } = await createScheduledSuspension({
+          userId: studentForSuspension.id,
+          scheduleSuspendDate: data.scheduleSuspendDate,
+          reason: data.note,
+          autoUnsuspendDate: data.autoUnsuspendDate,
+          createdBy: user?.id || null,
+        });
+        if (error) throw error;
+
+        logAdminAction({
+          performedBy: user?.id || null,
+          targetUserId: studentForSuspension.id,
+          entityType: 'user',
+          entityId: studentForSuspension.id,
+          action: 'scheduled_suspension_created',
+          description: `Scheduled suspension for ${studentForSuspension.full_name} on ${format(data.scheduleSuspendDate, 'PPP')}`,
+          data: {
+            suspension_note: data.note || null,
+            schedule_suspend_date: data.scheduleSuspendDate.toISOString(),
+            auto_unsuspend_date: data.autoUnsuspendDate?.toISOString() || null,
+            student_name: studentForSuspension.full_name
+          }
+        });
+
+        toast({
+          title: 'Suspension Scheduled',
+          description: `${studentForSuspension.full_name} will be suspended on ${format(data.scheduleSuspendDate, 'PPP')}`
+        });
+        setSuspensionDialogOpen(false);
+        setStudentForSuspension(null);
+        refetchSuspensions(studentIds);
+        return;
+      }
+
+      // Immediate suspension
       const { error } = await supabase.from('users').update({
         lms_status: 'suspended',
         updated_at: new Date().toISOString()
       }).eq('id', studentForSuspension.id);
       if (error) throw error;
 
-      // Log suspension with metadata
       await supabase.from('user_activity_logs').insert({
         user_id: studentForSuspension.id,
         activity_type: 'lms_suspended',
@@ -293,7 +361,6 @@ export function StudentsManagement() {
         }
       });
 
-      // Also log to admin_logs for unified view
       logAdminAction({
         performedBy: user?.id || null,
         targetUserId: studentForSuspension.id,
@@ -324,6 +391,31 @@ export function StudentsManagement() {
       });
     } finally {
       setSuspensionLoading(false);
+    }
+  };
+
+  const handleCancelScheduledSuspension = async (student: Student) => {
+    try {
+      const { error } = await cancelScheduledSuspension(student.id);
+      if (error) throw error;
+
+      logAdminAction({
+        performedBy: user?.id || null,
+        targetUserId: student.id,
+        entityType: 'user',
+        entityId: student.id,
+        action: 'scheduled_suspension_cancelled',
+        description: `Scheduled suspension cancelled for ${student.full_name}`,
+        data: { student_name: student.full_name }
+      });
+
+      toast({
+        title: 'Scheduled Suspension Cancelled',
+        description: `Scheduled suspension for ${student.full_name} has been cancelled.`
+      });
+    } catch (error) {
+      console.error('Error cancelling scheduled suspension:', error);
+      toast({ title: 'Error', description: 'Failed to cancel scheduled suspension', variant: 'destructive' });
     }
   };
 
@@ -361,15 +453,65 @@ export function StudentsManagement() {
   };
   const fetchStudents = async () => {
     try {
-      // Fetch student user_ids from user_roles table, then fetch their data
-      const { data: studentRoles, error: rolesError } = await supabase
-        .from('user_roles')
-        .select('user_id')
-        .eq('role', 'student');
-      if (rolesError) throw rolesError;
+      console.log('[StudentsManagement] fetchStudents: starting', {
+        currentUserId: user?.id,
+        currentUserRole: user?.role,
+        currentUserEmail: user?.email,
+      });
+      // Resilient lookup: students must be visible whether they're tagged in
+      // the `user_roles` junction table OR have role='student' on the users
+      // table. We union both sources to avoid invisibility from legacy rows
+      // that never got an explicit user_roles entry.
+      const [rolesRes, legacyRes, allUsersRes] = await Promise.all([
+        supabase.from('user_roles').select('user_id, role').eq('role', 'student'),
+        supabase.from('users').select('id, role').eq('role', 'student'),
+        // Diagnostic: count all users visible to this caller, broken down by role.
+        // If this returns 0 rows we know RLS is blocking everything.
+        supabase.from('users').select('id, role'),
+      ]);
+      if (rolesRes.error) {
+        console.error('[StudentsManagement] user_roles query error:', rolesRes.error);
+      }
+      if (legacyRes.error) {
+        console.warn('[StudentsManagement] users.role lookup failed:', legacyRes.error);
+      }
+      if (allUsersRes.error) {
+        console.error('[StudentsManagement] users (all) query error:', allUsersRes.error);
+      }
 
-      const studentUserIds = studentRoles?.map(r => r.user_id) || [];
+      const visibleUsers = allUsersRes.data || [];
+      const roleBreakdown = visibleUsers.reduce<Record<string, number>>((acc, u: any) => {
+        const r = u.role || 'null';
+        acc[r] = (acc[r] || 0) + 1;
+        return acc;
+      }, {});
+      console.log('[StudentsManagement] RLS visibility check:', {
+        totalUsersVisible: visibleUsers.length,
+        roleBreakdown,
+        userRolesStudentRows: rolesRes.data?.length || 0,
+        usersStudentRows: legacyRes.data?.length || 0,
+      });
+
+      const idSet = new Set<string>();
+      (rolesRes.data || []).forEach((r: any) => r?.user_id && idSet.add(r.user_id));
+      (legacyRes.data || []).forEach((u: any) => u?.id && idSet.add(u.id));
+      const studentUserIds = Array.from(idSet);
+
       if (studentUserIds.length === 0) {
+        // Surface the underlying reason so the user sees something actionable
+        // instead of a silent empty table.
+        if (visibleUsers.length === 0 && !allUsersRes.error) {
+          toast({
+            title: 'No users visible',
+            description: `RLS may be blocking access. Logged in as ${user?.email || 'unknown'} (${user?.role || 'no role'}).`,
+            variant: 'destructive',
+          });
+        } else if (visibleUsers.length > 0) {
+          toast({
+            title: 'No students found',
+            description: `Database contains ${visibleUsers.length} users but none with role=student. Roles seen: ${Object.keys(roleBreakdown).join(', ') || 'none'}.`,
+          });
+        }
         setStudents([]);
         setTotalStudents(0);
         setActiveStudents(0);
@@ -378,18 +520,88 @@ export function StudentsManagement() {
         return;
       }
 
-      // Fetch users and their corresponding student records in parallel
-      const [usersRes, studentsRes] = await Promise.all([
-        supabase.from('users').select('*, creator:created_by(full_name, email)').in('id', studentUserIds).order('created_at', { ascending: false }),
+      // Self-heal: backfill missing user_roles rows so future queries see them
+      // immediately. Errors here are non-fatal.
+      const knownRoleIds = new Set((rolesRes.data || []).map((r: any) => r.user_id));
+      const missingRoleIds = studentUserIds.filter(id => !knownRoleIds.has(id));
+      if (missingRoleIds.length > 0) {
+        console.log('[StudentsManagement] backfilling user_roles for', missingRoleIds.length, 'students');
+        supabase
+          .from('user_roles')
+          .upsert(
+            missingRoleIds.map(uid => ({ user_id: uid, role: 'student' as const })),
+            { onConflict: 'user_id,role', ignoreDuplicates: true }
+          )
+          .then(({ error }) => {
+            if (error) console.warn('[StudentsManagement] user_roles backfill failed:', error);
+          });
+      }
+
+      // Fetch users and their corresponding student records in parallel.
+      // NOTE: The embedded `creator:created_by(...)` relationship can hang/fail
+      // when the FK is missing or ambiguous. Fetch creators separately instead.
+      // IMPORTANT: Chunk the .in() call to avoid PostgREST "Bad Request" from
+      // URL length limits when there are hundreds of student IDs.
+      const chunkArray = <T,>(arr: T[], size: number): T[][] => {
+        const out: T[][] = [];
+        for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+        return out;
+      };
+      const idChunks = chunkArray(studentUserIds, 100);
+      const [usersChunkResults, studentsRes] = await Promise.all([
+        Promise.all(
+          idChunks.map(chunk =>
+            supabase.from('users').select('*').in('id', chunk)
+          )
+        ),
         supabase.from('students').select('id, user_id, student_id, installment_count')
       ]);
-      if (usersRes.error) throw usersRes.error;
+      const usersErrEntry = usersChunkResults.find(r => r.error);
+      const usersData = usersChunkResults.flatMap(r => r.data || []);
+      // Sort newest-first to mimic the previous .order('created_at', desc)
+      usersData.sort((a: any, b: any) => {
+        const at = a?.created_at ? new Date(a.created_at).getTime() : 0;
+        const bt = b?.created_at ? new Date(b.created_at).getTime() : 0;
+        return bt - at;
+      });
+      console.log('[StudentsManagement] users/students queries done', {
+        usersErr: usersErrEntry?.error?.message,
+        studentsErr: studentsRes.error?.message,
+        userCount: usersData.length,
+        chunks: idChunks.length,
+      });
+      if (usersErrEntry?.error) throw usersErrEntry.error;
       if (studentsRes.error) {
         console.warn('Warning fetching students table:', studentsRes.error);
       }
 
-      const usersData = usersRes.data || [];
       const studentsTable = studentsRes.data || [];
+
+      // Resolve creators in a separate, resilient query
+      const creatorIds = Array.from(new Set(
+        usersData.map((u: any) => u.created_by).filter((id: any) => !!id)
+      ));
+      let creatorMap = new Map<string, { full_name: string; email: string }>();
+      if (creatorIds.length > 0) {
+        const creatorChunks = chunkArray(creatorIds as string[], 100);
+        const creatorResults = await Promise.all(
+          creatorChunks.map(chunk =>
+            supabase.from('users').select('id, full_name, email').in('id', chunk)
+          )
+        );
+        const creatorsData = creatorResults.flatMap(r => r.data || []);
+        const creatorsErr = creatorResults.find(r => r.error)?.error;
+        if (creatorsErr) {
+          console.warn('Warning fetching creators:', creatorsErr);
+        }
+        creatorMap = new Map(
+          creatorsData.map((c: any) => [c.id as string, { full_name: c.full_name, email: c.email }])
+        );
+      }
+      // Attach creator info onto each user object
+      usersData.forEach((u: any) => {
+        u.creator = u.created_by ? (creatorMap.get(u.created_by) || null) : null;
+      });
       const studentIdMap = new Map<string, { student_id: string | null; student_record_id: string | null; installment_count: number | null }>(
         studentsTable.map((s: any) => [s.user_id as string, { student_id: s.student_id as string | null, student_record_id: s.id as string | null, installment_count: (s.installment_count as number | null) ?? null }])
       );
@@ -401,6 +613,12 @@ export function StudentsManagement() {
         const feesStructure = count === 1 ? '1_installment' : count === 2 ? '2_installments' : count === 3 ? '3_installments' : count ? `${count}_installments` : '';
         return {
           ...user,
+          full_name: user.full_name || user.email || 'Unnamed Student',
+          email: user.email || '',
+          created_at: user.created_at || '',
+          last_active_at: user.last_active_at || '',
+          lms_user_id: user.lms_user_id || '',
+          lms_status: user.lms_status || 'inactive',
           student_id: mapEntry?.student_id || '',
           student_record_id: mapEntry?.student_record_id || null,
           phone: user.phone || '',
@@ -443,7 +661,14 @@ export function StudentsManagement() {
 
     // Apply search filter
     if (searchTerm) {
-      filtered = filtered.filter(student => student.student_id?.toLowerCase().includes(searchTerm.toLowerCase()) || student.full_name.toLowerCase().includes(searchTerm.toLowerCase()) || student.email.toLowerCase().includes(searchTerm.toLowerCase()) || student.phone?.toLowerCase().includes(searchTerm.toLowerCase()));
+      const normalizedSearch = searchTerm.toLowerCase();
+      filtered = filtered.filter(student => {
+        const studentId = student.student_id?.toLowerCase?.() || '';
+        const fullName = student.full_name?.toLowerCase?.() || '';
+        const email = student.email?.toLowerCase?.() || '';
+        const phone = student.phone?.toLowerCase?.() || '';
+        return studentId.includes(normalizedSearch) || fullName.includes(normalizedSearch) || email.includes(normalizedSearch) || phone.includes(normalizedSearch);
+      });
     }
 
     // Apply LMS status filter
@@ -567,7 +792,7 @@ export function StudentsManagement() {
         error
       } = await supabase.from('users').update({
         lms_status: 'suspended',
-        last_suspended_date: new Date().toISOString()
+        updated_at: new Date().toISOString()
       }).eq('id', studentId);
       if (error) throw error;
       // Log suspension via handleSuspendAccount
@@ -618,57 +843,26 @@ export function StudentsManagement() {
   };
   const handleResendInvoice = async (student: Student) => {
     try {
-      if (!student.student_record_id) {
-        toast({
-          title: 'Error',
-          description: 'No student record to find invoices',
-          variant: 'destructive'
-        });
-        return;
-      }
-      const {
-        data: invoice,
-        error
-      } = await supabase.from('invoices').select('*').eq('student_id', student.student_record_id).neq('status', 'paid').order('created_at', {
-        ascending: false
-      }).limit(1).maybeSingle();
+      const { data, error } = await supabase.functions.invoke('resend-invoice', {
+        body: { student_ids: [student.id] }
+      });
       if (error) throw error;
-      if (!invoice) {
-        toast({
-          title: 'No Invoice Found',
-          description: 'This student has no unpaid invoices to resend.',
-          variant: 'destructive'
-        });
+
+      const hasFailures = data?.failed > 0;
+      if (data?.no_unpaid_invoice === 1 && data?.sent === 0) {
+        toast({ title: 'No Invoice Found', description: 'This student has no unpaid invoices to resend.', variant: 'destructive' });
         return;
       }
-      const {
-        error: rpcError
-      } = await supabase.rpc('create_notification', {
-        p_user_id: student.id,
-        p_type: 'invoice_issued',
-        p_title: 'Invoice Issued',
-        p_message: `Invoice #${invoice.installment_number || ''} has been re-sent.`,
-        p_metadata: {
-          invoice_id: invoice.id,
-          student_user_id: student.id,
-          amount: invoice.amount,
-          due_date: invoice.due_date,
-          installment_number: invoice.installment_number,
-          resent: true
-        }
-      });
-      if (rpcError) throw rpcError;
       toast({
-        title: 'Success',
-        description: 'Invoice re-sent to student.'
+        title: hasFailures ? 'Invoice Resend Failed' : 'Success',
+        description: data?.errors?.length
+          ? `Errors: ${data.errors.join('; ')}`
+          : data?.message || 'Invoice resent successfully.',
+        variant: hasFailures ? 'destructive' : 'default',
       });
-    } catch (e) {
+    } catch (e: any) {
       console.error('Error resending invoice:', e);
-      toast({
-        title: 'Error',
-        description: 'Failed to resend invoice',
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: e?.message || 'Failed to resend invoice', variant: 'destructive' });
     }
   };
 
@@ -923,9 +1117,11 @@ export function StudentsManagement() {
         return 'Unknown';
     }
   };
-  const formatDate = (dateString: string) => {
+  const formatDate = (dateString?: string | null) => {
     if (!dateString) return 'N/A';
-    return new Date(dateString).toLocaleDateString('en-US', {
+    const date = new Date(dateString);
+    if (Number.isNaN(date.getTime())) return 'N/A';
+    return date.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
       day: 'numeric'
@@ -1290,6 +1486,34 @@ export function StudentsManagement() {
       setSelectedStudents(new Set(displayStudents.map(s => s.id)));
     } else {
       setSelectedStudents(new Set());
+    }
+  };
+  const [bulkResendLoading, setBulkResendLoading] = useState(false);
+  const handleBulkResendInvoice = async () => {
+    if (selectedStudents.size === 0) {
+      toast({ title: 'Error', description: 'Please select at least one student', variant: 'destructive' });
+      return;
+    }
+    setBulkResendLoading(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('resend-invoice', {
+        body: { student_ids: Array.from(selectedStudents) }
+      });
+      if (error) throw error;
+      const hasFailures = data?.failed > 0;
+      toast({
+        title: hasFailures ? 'Invoice Resend - Some Failed' : 'Invoice Resend Complete',
+        description: data?.errors?.length
+          ? `${data.message}\nErrors: ${data.errors.join('; ')}`
+          : data?.message || `Sent ${data?.sent || 0} invoice(s)`,
+        variant: hasFailures ? 'destructive' : 'default',
+      });
+      setSelectedStudents(new Set());
+    } catch (error: any) {
+      console.error('Error resending invoices:', error);
+      toast({ title: 'Error', description: error?.message || 'Failed to resend invoices', variant: 'destructive' });
+    } finally {
+      setBulkResendLoading(false);
     }
   };
   const handleBulkLMSAction = async (action: 'suspend' | 'activate') => {
@@ -1708,12 +1932,14 @@ export function StudentsManagement() {
       return;
     }
     try {
-      const updateField = passwordType === 'temp' ? 'temp_password' : 'lms_password';
+      const passwordUpdate = {
+        password_display: newPassword,
+        is_temp_password: passwordType === 'temp',
+        updated_at: new Date().toISOString(),
+      };
       const {
         error
-      } = await supabase.from('users').update({
-        [updateField]: newPassword
-      }).eq('id', selectedStudentForPassword.id);
+      } = await supabase.from('users').update(passwordUpdate).eq('id', selectedStudentForPassword.id);
       if (error) throw error;
       toast({
         title: "Success",
@@ -2362,6 +2588,12 @@ export function StudentsManagement() {
                 </PopoverContent>
               </Popover>
 
+              {/* Resend Invoice */}
+              <Button variant="outline" size="sm" className="h-8 text-xs sm:text-sm gap-1.5" onClick={handleBulkResendInvoice} disabled={bulkResendLoading}>
+                <Send className="w-3.5 h-3.5" />
+                <span className="hidden xs:inline">{bulkResendLoading ? 'Sending...' : 'Resend'}</span> Invoice
+              </Button>
+
               {/* Batch Assignment */}
               <Button variant="outline" size="sm" className="h-8 text-xs sm:text-sm gap-1.5" onClick={openBulkBatchDialog}>
                 <Users className="w-3.5 h-3.5" />
@@ -2438,6 +2670,17 @@ export function StudentsManagement() {
                                  <span className="text-xs font-medium">{getLMSStatusLabel(student.lms_status)}</span>
                                </div>
                              </Badge>
+                              {(() => {
+                                const scheduled = scheduledSuspensions.get(student.id);
+                                if (!scheduled) return null;
+                                const scheduledDate = formatDate(scheduled.schedule_suspend_date);
+                                return (
+                                  <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 cursor-pointer" onClick={() => handleCancelScheduledSuspension(student)} title={`Scheduled: ${scheduledDate}. Click to cancel.`}>
+                                    <Clock className="w-3 h-3 mr-1" />
+                                    <span className="text-xs font-medium">Suspend: {scheduledDate}</span>
+                                  </Badge>
+                                );
+                              })()}
                              {!isSupportMember && (() => {
                         const inst = getInstallmentStatus(student);
                         return <Badge className={inst.color}>
@@ -3142,7 +3385,7 @@ export function StudentsManagement() {
                     <SelectItem value="none">No Batch (Use LMS Access Date)</SelectItem>
                     {editBatches.map((batch) => (
                       <SelectItem key={batch.id} value={batch.id}>
-                        {batch.name} (Start: {new Date(batch.start_date).toLocaleDateString()})
+                        {batch.name} (Start: {formatDate(batch.start_date)})
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -3224,7 +3467,7 @@ export function StudentsManagement() {
                   <SelectItem value="none">No Batch</SelectItem>
                   {bulkBatches.map((batch) => (
                     <SelectItem key={batch.id} value={batch.id}>
-                      {batch.name} (Start: {new Date(batch.start_date).toLocaleDateString()})
+                      {batch.name} (Start: {formatDate(batch.start_date)})
                     </SelectItem>
                   ))}
                 </SelectContent>
