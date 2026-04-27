@@ -11,7 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { AlertTriangle, Plus, Edit, Trash2, Users, Activity, DollarSign, Download, CheckCircle, XCircle, Search, Filter, Clock, Ban, ChevronDown, ChevronUp, FileText, Key, Lock, Eye, Settings, Award, CalendarIcon, MessageSquare } from 'lucide-react';
+import { AlertTriangle, Plus, Edit, Trash2, Users, Activity, DollarSign, Download, CheckCircle, XCircle, Search, Filter, Clock, Ban, ChevronDown, ChevronUp, FileText, Key, Lock, Eye, Settings, Award, CalendarIcon, MessageSquare, Send, ChevronLeft, ChevronRight } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Calendar } from '@/components/ui/calendar';
 import { format } from 'date-fns';
@@ -28,6 +28,8 @@ import { StudentNotesDialog } from '@/components/StudentNotesDialog';
 import { useAuth } from '@/hooks/useAuth';
 import jsPDF from 'jspdf';
 import { logAdminAction, ACTIVITY_TYPES } from '@/lib/activity-logger';
+import { useScheduledSuspensions } from '@/hooks/useScheduledSuspensions';
+import type { SuspensionConfirmData } from '@/components/SuspensionDialog';
 interface Student {
   id: string;
   student_id: string;
@@ -65,6 +67,8 @@ interface ActivityLog {
   metadata: any;
   reference_id: string;
 }
+const PAGE_SIZE = 25;
+
 export const StudentManagement = () => {
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
@@ -108,10 +112,20 @@ export const StudentManagement = () => {
   const [suspensionLoading, setSuspensionLoading] = useState(false);
   const [notesDialogOpen, setNotesDialogOpen] = useState(false);
   const [selectedStudentForNotes, setSelectedStudentForNotes] = useState<Student | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
   const { toast } = useToast();
   const { options: installmentOptions } = useInstallmentOptions();
   const { deleteUser, loading: deleteLoading } = useUserManagement();
   const { user } = useAuth();
+
+  const studentIds = students.map(s => s.id);
+  const {
+    suspensions: scheduledSuspensions,
+    createScheduledSuspension,
+    cancelScheduledSuspension,
+    fetchSuspensions: refetchSuspensions,
+  } = useScheduledSuspensions(studentIds);
+
   useEffect(() => {
     fetchStudents();
     fetchBatchOptions();
@@ -123,7 +137,12 @@ export const StudentManagement = () => {
   }, [students]);
   useEffect(() => {
     filterStudents();
-  }, [students, searchTerm, lmsStatusFilter, feesStructureFilter, invoiceFilter, installmentPayments, timeTick, batchFilter, studentBatchMap]);
+    setCurrentPage(1); // Reset page when filters change
+  }, [searchTerm, lmsStatusFilter, feesStructureFilter, invoiceFilter, batchFilter]);
+
+  useEffect(() => {
+    filterStudents();
+  }, [students, installmentPayments, timeTick, studentBatchMap]);
 
   // Re-render periodically so time-based invoice statuses (due/overdue) update without refresh
   useEffect(() => {
@@ -154,9 +173,10 @@ export const StudentManagement = () => {
       const {
         data,
         error
-      } = await supabase.from('invoices').select('*').order('installment_number', {
-        ascending: true
-      });
+      } = await supabase
+        .from('invoices')
+        .select('id, student_id, installment_number, amount, status, due_date, created_at, first_reminder_sent_at, second_reminder_sent_at')
+        .order('installment_number', { ascending: true });
       if (error) throw error;
 
       // Group invoices by student_id and convert to installment payment format
@@ -226,9 +246,11 @@ export const StudentManagement = () => {
 
       // Fetch users, students, and invoices in parallel
       const [usersRes, studentsRes, invoicesRes] = await Promise.all([
-        supabase.from('users').select('*').in('id', studentUserIds).order('created_at', {
-          ascending: false
-        }), 
+        supabase
+          .from('users')
+          .select('id, full_name, email, phone, role, status, lms_status, lms_user_id, password_display, created_at, last_active_at, fees_structure, fees_overdue, last_invoice_date, last_invoice_sent, fees_due_date, last_suspended_date, created_by')
+          .in('id', studentUserIds)
+          .order('created_at', { ascending: false }),
         supabase.from('students').select('id, user_id, student_id, installment_count, fees_cleared'),
         supabase.from('invoices').select('student_id, status, due_date, amount, created_at')
       ]);
@@ -508,10 +530,47 @@ export const StudentManagement = () => {
     }
   };
 
-  const handleSuspendStudent = async (data: { note: string; autoUnsuspendDate?: Date }) => {
+  const handleSuspendStudent = async (data: SuspensionConfirmData) => {
     if (!studentForSuspension) return;
     setSuspensionLoading(true);
     try {
+      // If a schedule date is set, create a scheduled suspension instead of immediate
+      if (data.scheduleSuspendDate) {
+        const { error } = await createScheduledSuspension({
+          userId: studentForSuspension.id,
+          scheduleSuspendDate: data.scheduleSuspendDate,
+          reason: data.note,
+          autoUnsuspendDate: data.autoUnsuspendDate,
+          createdBy: user?.id || null,
+        });
+        if (error) throw error;
+
+        logAdminAction({
+          performedBy: user?.id || null,
+          targetUserId: studentForSuspension.id,
+          entityType: 'user',
+          entityId: studentForSuspension.id,
+          action: 'scheduled_suspension_created',
+          description: `Scheduled suspension for ${studentForSuspension.full_name} on ${format(data.scheduleSuspendDate, 'PPP')}`,
+          data: {
+            suspension_note: data.note || null,
+            schedule_suspend_date: data.scheduleSuspendDate.toISOString(),
+            auto_unsuspend_date: data.autoUnsuspendDate?.toISOString() || null,
+            student_name: studentForSuspension.full_name
+          }
+        });
+
+        toast({
+          title: 'Suspension Scheduled',
+          description: `${studentForSuspension.full_name} will be suspended on ${format(data.scheduleSuspendDate, 'PPP')}`
+        });
+        setSuspensionDialogOpen(false);
+        setStudentForSuspension(null);
+        refetchSuspensions(studentIds);
+        return;
+      }
+
+      // Immediate suspension
       const { error } = await supabase.from('users').update({
         lms_status: 'suspended',
         updated_at: new Date().toISOString()
@@ -529,7 +588,6 @@ export const StudentManagement = () => {
         }
       });
 
-      // Also log to admin_logs for unified view
       logAdminAction({
         performedBy: user?.id || null,
         targetUserId: studentForSuspension.id,
@@ -556,6 +614,31 @@ export const StudentManagement = () => {
       toast({ title: 'Error', description: 'Failed to suspend student', variant: 'destructive' });
     } finally {
       setSuspensionLoading(false);
+    }
+  };
+
+  const handleCancelScheduledSuspension = async (student: Student) => {
+    try {
+      const { error } = await cancelScheduledSuspension(student.id);
+      if (error) throw error;
+
+      logAdminAction({
+        performedBy: user?.id || null,
+        targetUserId: student.id,
+        entityType: 'user',
+        entityId: student.id,
+        action: 'scheduled_suspension_cancelled',
+        description: `Scheduled suspension cancelled for ${student.full_name}`,
+        data: { student_name: student.full_name }
+      });
+
+      toast({
+        title: 'Scheduled Suspension Cancelled',
+        description: `Scheduled suspension for ${student.full_name} has been cancelled.`
+      });
+    } catch (error) {
+      console.error('Error cancelling scheduled suspension:', error);
+      toast({ title: 'Error', description: 'Failed to cancel scheduled suspension', variant: 'destructive' });
     }
   };
 
@@ -671,83 +754,37 @@ export const StudentManagement = () => {
   };
   const handleResendInvoice = async (student: Student) => {
     try {
-      if (!student.student_record_id) {
-        toast({
-          title: 'Error',
-          description: 'No student record to find invoices',
-          variant: 'destructive',
-        });
-        return;
-      }
-
-      // Allow resending for any unpaid invoice
-      const { data: invoice, error } = await supabase
-        .from('invoices')
-        .select('*')
-        .eq('student_id', student.student_record_id)
-        .neq('status', 'paid')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
+      const { data, error } = await supabase.functions.invoke('resend-invoice', {
+        body: { student_ids: [student.id] }
+      });
       if (error) throw error;
-      if (!invoice) {
-        toast({
-          title: 'No Invoice Found',
-          description: 'This student has no invoices to resend.',
-          variant: 'destructive',
-        });
+
+      const hasFailures = data?.failed > 0;
+      if (data?.no_unpaid_invoice === 1 && data?.sent === 0) {
+        toast({ title: 'No Invoice Found', description: 'This student has no unpaid invoices to resend.', variant: 'destructive' });
         return;
       }
-
-      // Get company settings for email details
-      const { data: settings } = await supabase
-        .from('company_settings')
-        .select('company_name, company_email, contact_email')
-        .single();
-
-      // Queue email in email_queue table
-      const { error: emailError } = await supabase
-        .from('email_queue')
-        .insert({
-          user_id: student.id,
-          recipient_email: student.email,
-          recipient_name: student.full_name,
-          email_type: 'invoice_resend',
-          status: 'pending',
-          credentials: {
-            invoice_id: invoice.id,
-            amount: invoice.amount,
-            due_date: invoice.due_date,
-            installment_number: invoice.installment_number,
-            status: invoice.status,
-            company_name: settings?.company_name || 'Company',
-            company_email: settings?.company_email || settings?.contact_email,
-          }
-        });
-
-      if (emailError) throw emailError;
-
-      // Also create in-app notification
-      await supabase.rpc('create_notification', {
-        p_user_id: student.id,
-        p_type: 'invoice_issued',
-        p_title: 'Invoice Reminder',
-        p_message: `Invoice #${invoice.installment_number || ''} has been re-sent. Status: ${invoice.status}`,
-        p_metadata: {
-          invoice_id: invoice.id,
-          student_user_id: student.id,
-          amount: invoice.amount,
-          due_date: invoice.due_date,
-          installment_number: invoice.installment_number,
-          resent: true,
-        },
+      toast({
+        title: hasFailures ? 'Invoice Resend Failed' : 'Success',
+        description: data?.errors?.length
+          ? `Errors: ${data.errors.join('; ')}`
+          : data?.message || 'Invoice resent successfully.',
+        variant: hasFailures ? 'destructive' : 'default',
       });
 
-      toast({ title: 'Success', description: 'Invoice email queued and notification sent to student.' });
-    } catch (e) {
+      if (!hasFailures) {
+        logAdminAction({
+          performedBy: user?.id || null,
+          targetUserId: student.id,
+          entityType: 'invoice',
+          action: ACTIVITY_TYPES.INVOICE_RESENT,
+          description: `Invoice resent to ${student.full_name || student.email}`,
+          data: { student_email: student.email, student_name: student.full_name }
+        });
+      }
+    } catch (e: any) {
       console.error('Error resending invoice:', e);
-      toast({ title: 'Error', description: 'Failed to resend invoice', variant: 'destructive' });
+      toast({ title: 'Error', description: e?.message || 'Failed to resend invoice', variant: 'destructive' });
     }
   };
 
@@ -1064,9 +1101,53 @@ export const StudentManagement = () => {
   };
   const handleSelectAll = (checked: boolean) => {
     if (checked) {
-      setSelectedStudents(new Set(displayStudents.map(s => s.id)));
+      setSelectedStudents(new Set(paginatedStudents.map(s => s.id)));
     } else {
       setSelectedStudents(new Set());
+    }
+  };
+  const [bulkResendLoading, setBulkResendLoading] = useState(false);
+  const handleBulkResendInvoice = async () => {
+    if (selectedStudents.size === 0) {
+      toast({ title: 'Error', description: 'Please select at least one student', variant: 'destructive' });
+      return;
+    }
+    setBulkResendLoading(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('resend-invoice', {
+        body: { student_ids: Array.from(selectedStudents) }
+      });
+      if (error) throw error;
+      const hasFailures = data?.failed > 0;
+      toast({
+        title: hasFailures ? 'Invoice Resend - Some Failed' : 'Invoice Resend Complete',
+        description: data?.errors?.length
+          ? `${data.message}\nErrors: ${data.errors.join('; ')}`
+          : data?.message || `Sent ${data?.sent || 0} invoice(s)`,
+        variant: hasFailures ? 'destructive' : 'default',
+      });
+      // Log each successful resend
+      if (data?.sent > 0) {
+        Array.from(selectedStudents).forEach(studentId => {
+          const student = displayStudents.find(s => s.id === studentId);
+          if (student) {
+            logAdminAction({
+              performedBy: user?.id || null,
+              targetUserId: studentId,
+              entityType: 'invoice',
+              action: ACTIVITY_TYPES.INVOICE_RESENT,
+              description: `Invoice resent to ${student.full_name || student.email}`,
+              data: { student_email: student.email, student_name: student.full_name, bulk: true }
+            });
+          }
+        });
+      }
+      setSelectedStudents(new Set());
+    } catch (error: any) {
+      console.error('Error resending invoices:', error);
+      toast({ title: 'Error', description: error?.message || 'Failed to resend invoices', variant: 'destructive' });
+    } finally {
+      setBulkResendLoading(false);
     }
   };
   const handleBulkLMSAction = async (action: 'suspend' | 'activate') => {
@@ -1121,11 +1202,12 @@ export const StudentManagement = () => {
     }
     try {
       const updateField = passwordType === 'temp' ? 'temp_password' : 'lms_password';
+      const passwordUpdate = passwordType === 'temp'
+        ? { password_display: newPassword, is_temp_password: true, updated_at: new Date().toISOString() }
+        : { password_display: newPassword, is_temp_password: false, updated_at: new Date().toISOString() };
       const {
         error
-      } = await supabase.from('users').update({
-        [updateField]: newPassword
-      }).eq('id', selectedStudentForPassword.id);
+      } = await supabase.from('users').update(passwordUpdate).eq('id', selectedStudentForPassword.id);
       if (error) throw error;
       toast({
         title: "Success",
@@ -1280,22 +1362,42 @@ export const StudentManagement = () => {
     batchFilter !== 'all'
   );
   const displayStudents = hasActiveFilters ? filteredStudents : students;
+  const totalPages = Math.max(1, Math.ceil(displayStudents.length / PAGE_SIZE));
+  const safePage = Math.min(currentPage, totalPages);
+  const paginatedStudents = displayStudents.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  const getPaginationRange = () => {
+    const range: (number | '...')[] = [];
+    if (totalPages <= 7) {
+      for (let i = 1; i <= totalPages; i++) range.push(i);
+    } else {
+      range.push(1);
+      if (safePage > 3) range.push('...');
+      for (let i = Math.max(2, safePage - 1); i <= Math.min(totalPages - 1, safePage + 1); i++) range.push(i);
+      if (safePage < totalPages - 2) range.push('...');
+      range.push(totalPages);
+    }
+    return range;
+  };
+
   return <div className="space-y-6 animate-fade-in px-0 mx-0">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
         <div className="animate-fade-in">
-          <h1 className="text-4xl font-bold bg-gradient-to-r from-primary to-blue-600 bg-clip-text text-transparent">
+          <h1 className="text-2xl sm:text-4xl font-bold bg-gradient-to-r from-primary to-blue-600 bg-clip-text text-transparent">
             👥 Students Management
           </h1>
-          <p className="text-muted-foreground mt-2 text-lg">Manage student records and track their progress</p>
+          <p className="text-muted-foreground mt-1 sm:mt-2 text-sm sm:text-lg">Manage student records and track their progress</p>
         </div>
-        <div className="flex gap-2">
-          <Button variant="outline" onClick={handleExportCSV} className="hover-scale animate-scale-in">
+        <div className="flex gap-2 w-full sm:w-auto">
+          <Button variant="outline" onClick={handleExportCSV} className="hover-scale animate-scale-in flex-1 sm:flex-none" size="sm">
             <Download className="w-4 h-4 mr-2" />
-            Export CSV
+            <span className="hidden sm:inline">Export CSV</span>
+            <span className="sm:hidden">Export</span>
           </Button>
-          <Button onClick={() => setIsDialogOpen(true)} className="hover-scale bg-gradient-to-r from-green-500 to-blue-500 hover:from-green-600 hover:to-blue-600 animate-scale-in">
+          <Button onClick={() => setIsDialogOpen(true)} className="hover-scale bg-gradient-to-r from-green-500 to-blue-500 hover:from-green-600 hover:to-blue-600 animate-scale-in flex-1 sm:flex-none" size="sm">
             <Plus className="w-4 h-4 mr-2" />
-            Add Student
+            <span className="hidden sm:inline">Add Student</span>
+            <span className="sm:hidden">Add</span>
           </Button>
         </div>
         <EnhancedStudentCreationDialog 
@@ -1312,7 +1414,7 @@ export const StudentManagement = () => {
       </div>
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3 sm:gap-4">
         <Card className="border-l-4 border-l-blue-500 hover-scale transition-all duration-300 hover:shadow-lg bg-gradient-to-br from-blue-50 to-white animate-fade-in">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium text-blue-800">Total Students</CardTitle>
@@ -1372,14 +1474,14 @@ export const StudentManagement = () => {
       </div>
 
       {/* Search and Filter */}
-      <div className="flex gap-4 items-center flex-wrap">
-        <div className="relative flex-1 max-w-md">
+      <div className="flex gap-3 items-center flex-wrap">
+        <div className="relative flex-1 min-w-[200px] max-w-md">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input placeholder="Search by ID, name, email, or phone..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="pl-10" />
         </div>
 
         <Select value={lmsStatusFilter} onValueChange={setLmsStatusFilter}>
-          <SelectTrigger className="w-40">
+          <SelectTrigger className="w-32 sm:w-40">
             <SelectValue placeholder="LMS Status" />
           </SelectTrigger>
           <SelectContent className="bg-white z-50">
@@ -1393,7 +1495,7 @@ export const StudentManagement = () => {
         </Select>
 
         <Select value={feesStructureFilter} onValueChange={setFeesStructureFilter}>
-          <SelectTrigger className="w-40">
+          <SelectTrigger className="w-32 sm:w-40">
             <SelectValue placeholder="Fees Structure" />
           </SelectTrigger>
           <SelectContent className="bg-white z-50">
@@ -1405,7 +1507,7 @@ export const StudentManagement = () => {
         </Select>
 
         <Select value={invoiceFilter} onValueChange={setInvoiceFilter}>
-          <SelectTrigger className="w-40">
+          <SelectTrigger className="w-32 sm:w-40">
             <SelectValue placeholder="Invoice Status" />
           </SelectTrigger>
           <SelectContent className="bg-white z-50">
@@ -1418,7 +1520,7 @@ export const StudentManagement = () => {
         </Select>
 
         <Select value={batchFilter} onValueChange={setBatchFilter}>
-          <SelectTrigger className="w-40">
+          <SelectTrigger className="w-32 sm:w-40">
             <SelectValue placeholder="Batch" />
           </SelectTrigger>
           <SelectContent className="bg-white z-50">
@@ -1433,8 +1535,8 @@ export const StudentManagement = () => {
 
       {/* Bulk Actions */}
       {selectedStudents.size > 0 && <Card className="bg-blue-50 border-blue-200">
-          <CardContent className="p-4">
-            <div className="flex items-center justify-between">
+          <CardContent className="p-3 sm:p-4">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div className="flex items-center space-x-4">
                 <span className="text-sm font-medium text-blue-800">
                   {selectedStudents.size} student(s) selected
@@ -1443,14 +1545,18 @@ export const StudentManagement = () => {
                   Clear Selection
                 </Button>
               </div>
-              <div className="flex space-x-2">
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" size="sm" onClick={handleBulkResendInvoice} disabled={bulkResendLoading} className="text-blue-600 border-blue-300 hover:bg-blue-50">
+                  <Send className="w-4 h-4 mr-2" />
+                  {bulkResendLoading ? 'Sending...' : 'Resend Invoice'}
+                </Button>
                 <Button variant="outline" size="sm" onClick={() => handleBulkLMSAction('suspend')} className="text-red-600 border-red-300 hover:bg-red-50">
                   <Ban className="w-4 h-4 mr-2" />
-                  Suspend LMS
+                  Suspend
                 </Button>
                 <Button variant="outline" size="sm" onClick={() => handleBulkLMSAction('activate')} className="text-green-600 border-green-300 hover:bg-green-50">
                   <CheckCircle className="w-4 h-4 mr-2" />
-                  Activate LMS
+                  Activate
                 </Button>
               </div>
             </div>
@@ -1470,7 +1576,7 @@ export const StudentManagement = () => {
             <TableHeader>
               <TableRow>
                 <TableHead className="w-10">
-                  <Checkbox checked={selectedStudents.size === displayStudents.length && displayStudents.length > 0} onCheckedChange={handleSelectAll} />
+                  <Checkbox checked={selectedStudents.size === paginatedStudents.length && paginatedStudents.length > 0} onCheckedChange={handleSelectAll} />
                 </TableHead>
                 <TableHead className="w-[100px]">Student ID</TableHead>
                 <TableHead className="min-w-[120px]">Name</TableHead>
@@ -1492,7 +1598,7 @@ export const StudentManagement = () => {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  displayStudents.map(student => [
+                  paginatedStudents.map(student => [
                     <TableRow key={student.id}>
                       <TableCell>
                         <Checkbox checked={selectedStudents.has(student.id)} onCheckedChange={checked => handleSelectStudent(student.id, checked as boolean)} />
@@ -1508,6 +1614,12 @@ export const StudentManagement = () => {
                                {getLMSStatusIcon(student.lms_status)}
                                {getLMSStatusLabel(student.lms_status)}
                              </Badge>
+                             {scheduledSuspensions.has(student.id) && (
+                               <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 cursor-pointer" onClick={() => handleCancelScheduledSuspension(student)} title={`Scheduled: ${new Date(scheduledSuspensions.get(student.id)!.schedule_suspend_date).toLocaleDateString()}. Click to cancel.`}>
+                                 <Clock className="w-3 h-3 mr-1" />
+                                 <span className="text-xs">Suspend: {new Date(scheduledSuspensions.get(student.id)!.schedule_suspend_date).toLocaleDateString()}</span>
+                               </Badge>
+                             )}
                             {student.fees_overdue && <Badge className="bg-orange-100 text-orange-800">
                                 <Clock className="w-3 h-3 mr-1" />
                                 Overdue
@@ -1826,6 +1938,31 @@ export const StudentManagement = () => {
               </TableBody>
             </Table>
         </CardContent>
+        {/* Pagination Controls */}
+        {totalPages > 1 && (
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 px-4 py-3 border-t">
+            <p className="text-sm text-muted-foreground">
+              Showing {(safePage - 1) * PAGE_SIZE + 1}–{Math.min(safePage * PAGE_SIZE, displayStudents.length)} of {displayStudents.length}
+            </p>
+            <div className="flex items-center gap-1">
+              <Button variant="outline" size="icon" className="h-8 w-8" disabled={safePage <= 1} onClick={() => setCurrentPage(safePage - 1)}>
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+              {getPaginationRange().map((p, i) =>
+                p === '...' ? (
+                  <span key={`dots-${i}`} className="px-2 text-muted-foreground text-sm">…</span>
+                ) : (
+                  <Button key={p} variant={p === safePage ? 'default' : 'outline'} size="icon" className="h-8 w-8 text-xs" onClick={() => setCurrentPage(p as number)}>
+                    {p}
+                  </Button>
+                )
+              )}
+              <Button variant="outline" size="icon" className="h-8 w-8" disabled={safePage >= totalPages} onClick={() => setCurrentPage(safePage + 1)}>
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        )}
       </Card>
 
       {/* Activity Logs Dialog */}
